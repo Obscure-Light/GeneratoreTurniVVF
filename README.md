@@ -1,57 +1,97 @@
 # VVF Weekend Scheduler
 
-Applicazione in Python per la gestione dei turni dei Vigili del Fuoco volontari. Consente di:
+Applicazione in Python per la pianificazione dei turni dei Vigili del Fuoco volontari. Il progetto combina una GUI Tkinter e un motore CLI per:
 
-- mantenere un'anagrafica completa di autisti e vigili (ruolo, grado, contatti, limiti settimanali);
-- configurare vincoli duri/morbidi, coppie preferenziali, ferie e impostazioni speciali (es. regola Varchi/Pogliani);
-- generare il piano turni annuale in formato Excel e ICS;
-- operare sia con database SQLite sia, in alternativa, con i file di testo legacy.
-
-Una GUI Tkinter (`vvf_gui.py`) permette di gestire tutte le impostazioni e lanciare la generazione senza toccare il codice.
+- gestire l’anagrafica di autisti e vigili con ruoli, contatti, livelli di esperienza e limiti settimanali;
+- configurare vincoli duri/morbidi (coppie vietate, preferenze, regole speciali, ferie);
+- generare i turni su periodi selezionati esportando Excel, ICS e log testuali;
+- operare sia con database SQLite sia (opzionalmente) con i file di testo legacy.
 
 ## Requisiti
 
-- Python 3.10+
-- Dipendenze Python (installabili con `pip install -r requirements.txt`):
-  - `pandas`
-  - `openpyxl`
-- Per la GUI: Tkinter (su Linux installare il pacchetto di sistema `python3-tk`).
+- **Python 3.10+**  
+  Installare le dipendenze con:
+  ```bash
+  pip install -r requirements.txt
+  ```
+  (Pacchetti principali: `pandas`, `openpyxl`.)
 
-## Struttura principale
+- **Tkinter** per la GUI (su Debian/Ubuntu: `sudo apt install python3-tk`).
 
-- `database.py`: layer SQLite, schema e operazioni di import/export.
-- `turnivvf.py`: motore di generazione turni ed esportazione.
-- `vvf_gui.py`: interfaccia grafica per la gestione dati e lanciare lo scheduler.
-- `requirements.txt`: dipendenze Python.
+## Struttura del progetto
 
-## Uso rapido
+```
+vvf_scheduler/         # Motore di pianificazione e export
+  core.py              # Algoritmo principale (Scheduler)
+  config.py            # Costruzione ProgramConfig da file legacy
+  constants.py         # Costanti condivise (nomi giorni, mesi ecc.)
+  exports.py           # Esportazione Excel/ICS
+  rules.py             # Definizioni regole Hard/Soft/Off
+  runner.py            # Funzione esegui(...) usata da CLI e GUI
 
-1. **Installazione dipendenze**
-   ```bash
-   pip install -r requirements.txt
-   ```
-   Su Linux, se necessario: `sudo apt install python3-tk`.
+database.py            # Layer SQLite e accesso dati
+turnivvf.py            # Entry point CLI
+vvf_gui.py             # Interfaccia grafica Tkinter
+requirements.txt       # Dipendenze Python
+vvf_data.db            # Database SQLite (se presente)
+autisti.txt / vigili.txt / vigili_senior.txt (facoltativi legacy)
+```
 
-2. **Avvio GUI**
-   ```bash
-   python vvf_gui.py
-   ```
-   - Tab "Personale": gestisci anagrafica (ruoli, contatti, limiti)
-   - Tab "Coppie & Vincoli": definisci vincoli duri/morbidi e preferenze
-   - Tab "Ferie": inserisci periodi di indisponibilità
-   - Tab "Impostazioni": regola giorni pianificati, senior minimi, regola Varchi/Pogliani
-   - Tab "Genera turni": scegli anno, seed, cartella output e premi "Genera"
+## Modalità d’uso
 
-3. **Esecuzione CLI** (senza GUI)
-   ```bash
-   python turnivvf_fixed.py --year 2025 --db vvf_data.db --out output
-   ```
-   Opzioni utili:
-   - `--import-from-text --autisti autisti.txt --vigili vigili.txt --vigili-senior vigili_senior.txt`
-   - `--skip-db` per usare solo i file legacy.
+### GUI
+Avviare l’interfaccia con:
+```bash
+python vvf_gui.py
+```
 
-## Note
+Tab principali:
+- **Personale**: anagrafica (ruoli, contatti, limiti settimanali).
+- **Coppie & Vincoli**: gestione coppie vietate/preferite con severità Hard/Soft.
+- **Ferie**: configurazione periodi di indisponibilità.
+- **Impostazioni**: selezione giorni attivi e pannello “Parametri di generazione” con toggle Hard/Soft/Off per regole come:
+  - `Limite turni settimanali`
+  - `Esclusione estiva`
+  - `Regola Varchi/Pogliani`
+  - `Minimo SENIOR in squadra` (valore configurabile)
+- **Genera turni**: scelta anno, mesi (con “Tutti i mesi”), seed RNG, cartella output, eventuale import legacy o uso totale dei file di testo.
 
-- I file generati finiscono nella cartella scelta (`turni_<anno>.xlsx`, `turni_<anno>.ics`, `log_<anno>.txt`).
-- I messaggi di log riportano eventuali deroghe o applicazioni della regola Varchi/Pogliani.
-- La GUI consente di attivare/disattivare la regola speciale con una spunta; i conteggi restano attribuiti all’autista reale.
+Lo stato delle regole viene ripristinato ai valori di default a ogni avvio; è possibile salvare le preferenze premendo “Salva impostazioni”.
+
+### CLI
+
+Esempi di utilizzo:
+```bash
+# Genera l'intero anno usando il database SQLite
+python turnivvf.py --year 2025 --db vvf_data.db --out output
+
+# Genera solo Gennaio-Febbraio 2026 con logging dettagliato
+python turnivvf.py --year 2026 --months 1 2 --db vvf_data.db --out output --verbose
+
+# Importa i file legacy nel DB prima di generare
+python turnivvf.py --year 2025 --db vvf_data.db --out output \
+    --import-from-text --autisti autisti.txt --vigili vigili.txt --vigili-senior vigili_senior.txt
+
+# Modalità completamente legacy (senza DB)
+python turnivvf.py --year 2025 --skip-db \
+    --autisti autisti.txt --vigili vigili.txt --vigili-senior vigili_senior.txt --out output
+```
+
+Opzioni principali:
+- `--year` anno di riferimento;
+- `--months` lista di mesi (1-12) da includere;
+- `--out` cartella output (genererà `turni_<anno>.xlsx`, `turni_<anno>.ics`, `log_<anno>.txt`);
+- `--seed` per rendere deterministica la generazione;
+- `--verbose` abilita log dettagliati su stdout.
+
+## Log e output
+- Il log testuale riporta le deroghe applicate (ad esempio quando un vincolo soft viene rilassato).
+- L’Excel contiene un foglio per ogni mese generato e un report statistico (autisti e vigili).
+- Il file ICS esporta gli eventi per autisti e vigili (timezone Europe/Rome).
+
+## Suggerimenti
+- Verificare che `pandas`/`openpyxl` siano installati nell’ambiente usato dalla GUI; in caso contrario la generazione darà errore.
+- Se si importano dati legacy, assicurarsi che i file siano codificati in UTF-8 per evitare errori di decodifica.
+- La GUI consente di selezionare solo alcuni mesi: utile per rigenerare periodi già approvati senza toccare l’intero anno.
+
+Buon lavoro con lo Scheduler! Per segnalazioni o miglioramenti aprire una issue nel repository. 

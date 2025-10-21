@@ -7,6 +7,13 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+from vvf_scheduler.rules import (
+    GenerationRuleConfig,
+    RULE_DEFINITIONS,
+    RuleMode,
+    build_default_rules,
+)
+
 
 DEFAULT_FORBIDDEN_PAIRS: Set[Tuple[str, str]] = {
     ("Copellini", "Gallicchio"),
@@ -128,6 +135,7 @@ class ProgramConfig:
     active_weekdays: Set[int] = field(default_factory=lambda: set(DEFAULT_ACTIVE_WEEKDAYS))
     people: Dict[str, PersonProfile] = field(default_factory=dict)
     enable_varchi_rule: bool = True
+    generation_rules: Dict[str, GenerationRuleConfig] = field(default_factory=dict)
 
 
 class Database:
@@ -423,6 +431,48 @@ class Database:
         cur = self.conn.execute("SELECT key, value FROM settings")
         return {row["key"]: row["value"] for row in cur.fetchall()}
 
+    def _load_generation_rules(self) -> Dict[str, GenerationRuleConfig]:
+        rules = build_default_rules()
+        for key, definition in RULE_DEFINITIONS.items():
+            mode_raw = self.get_setting(f"rule.{key}.mode")
+            mode = RuleMode.from_value(mode_raw)
+            value = rules[key].value
+            if definition.has_value:
+                val_raw = self.get_setting(f"rule.{key}.value")
+                if val_raw is not None:
+                    try:
+                        parsed = int(val_raw)
+                    except ValueError:
+                        parsed = definition.default_value
+                    if definition.min_value is not None:
+                        parsed = max(definition.min_value, parsed)
+                    if definition.max_value is not None:
+                        parsed = min(definition.max_value, parsed)
+                    value = parsed
+            rules[key] = GenerationRuleConfig(mode=mode, value=value)
+        return rules
+
+    def load_generation_rules_config(self) -> Dict[str, GenerationRuleConfig]:
+        return self._load_generation_rules()
+
+    def save_generation_rule(self, key: str, config: GenerationRuleConfig) -> None:
+        definition = RULE_DEFINITIONS.get(key)
+        if definition is None:
+            raise KeyError(f"Regola sconosciuta: {key}")
+        self.set_setting(f"rule.{key}.mode", config.mode.value)
+        if definition.has_value:
+            if config.value is not None:
+                self.set_setting(f"rule.{key}.value", str(config.value))
+            else:
+                self.set_setting(f"rule.{key}.value", None)
+        else:
+            self.set_setting(f"rule.{key}.value", None)
+
+    def reset_generation_rules_to_defaults(self) -> None:
+        defaults = build_default_rules()
+        for key, cfg in defaults.items():
+            self.save_generation_rule(key, cfg)
+
     # ------------------------------------------------------------------ #
     # Pairs
     # ------------------------------------------------------------------ #
@@ -652,6 +702,15 @@ class Database:
         if not active_weekdays:
             active_weekdays = set(DEFAULT_ACTIVE_WEEKDAYS)
         varchi_rule_enabled = enable_varchi_rule_str != "0"
+        rules = self._load_generation_rules()
+        rule_min_senior = rules.get("min_senior")
+        if rule_min_senior:
+            if rule_min_senior.value is None:
+                rule_min_senior.value = min_esperti_value
+            else:
+                min_esperti_value = rule_min_senior.value
+        if rules.get("varchi_rotation") and rules["varchi_rotation"].mode == RuleMode.OFF:
+            varchi_rule_enabled = False
 
         autista_varchi_name = _match_person_identifier(key_autista_varchi, autisti, profiles)
         autista_pogliani_name = _match_person_identifier(key_autista_pogliani, autisti, profiles)
@@ -663,6 +722,8 @@ class Database:
             autista_pogliani_name = _match_person_identifier(DEFAULT_AUTISTA_POGLIANI, autisti, profiles)
         if not vigile_estivo_name:
             vigile_estivo_name = _match_person_identifier(DEFAULT_VIGILE_ESCLUSO_ESTATE, vigili, profiles)
+        if rules.get("summer_exclusion") and rules["summer_exclusion"].mode == RuleMode.OFF:
+            vigile_estivo_name = None
 
         if not varchi_rule_enabled:
             autista_varchi_name = None
@@ -683,6 +744,7 @@ class Database:
             active_weekdays=active_weekdays,
             people=profiles,
             enable_varchi_rule=varchi_rule_enabled,
+            generation_rules=rules,
         )
 
     # ------------------------------------------------------------------ #

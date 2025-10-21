@@ -6,10 +6,17 @@ import queue
 import subprocess
 import sys
 import threading
+import locale
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Dict, List, Optional, Set
+
+from vvf_scheduler.rules import (
+    RULE_DEFINITIONS,
+    GenerationRuleConfig,
+    RuleMode,
+)
 
 from database import (
     Database,
@@ -35,6 +42,26 @@ WEEKDAY_LABELS = {
     5: "Sabato",
     6: "Domenica",
 }
+MONTH_LABELS = {
+    1: "Gen",
+    2: "Feb",
+    3: "Mar",
+    4: "Apr",
+    5: "Mag",
+    6: "Giu",
+    7: "Lug",
+    8: "Ago",
+    9: "Set",
+    10: "Ott",
+    11: "Nov",
+    12: "Dic",
+}
+MODE_DISPLAY = {
+    RuleMode.HARD.value: "Hard (obbligatorio)",
+    RuleMode.SOFT.value: "Soft (flessibile)",
+    RuleMode.OFF.value: "Off (disattivo)",
+}
+MODE_FROM_DISPLAY = {label: key for key, label in MODE_DISPLAY.items()}
 
 LIV_JUNIOR = "JUNIOR"
 
@@ -49,6 +76,7 @@ class SchedulerManagerApp(tk.Tk):
 
         self.db_path = Path(db_path)
         self.db = Database(self.db_path)
+        self.db.reset_generation_rules_to_defaults()
         self.people_cache: Dict[int, Dict[str, object]] = {}
         self.name_to_id: Dict[str, int] = {}
         self.autisti_names: Set[str] = set()
@@ -645,16 +673,57 @@ class SchedulerManagerApp(tk.Tk):
         self.setting_vigile_estate_combo = ttk.Combobox(container, textvariable=self.setting_vigile_estate, state="readonly")
         self.setting_vigile_estate_combo.grid(row=2, column=1, padx=6, pady=6, sticky="ew")
 
-        ttk.Label(container, text="Senior minimi per squadra").grid(row=3, column=0, padx=6, pady=6, sticky="w")
-        self.setting_min_esperti = tk.IntVar(value=DEFAULT_MIN_ESPERTI)
-        ttk.Spinbox(container, from_=0, to=4, textvariable=self.setting_min_esperti, width=5).grid(row=3, column=1, padx=6, pady=6, sticky="w")
-
         self.setting_varchi_rule = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             container,
             text="Abilita regola speciale Varchi/Pogliani (default consigliato)",
             variable=self.setting_varchi_rule,
-        ).grid(row=4, column=0, columnspan=2, padx=6, pady=6, sticky="w")
+        ).grid(row=3, column=0, columnspan=2, padx=6, pady=6, sticky="w")
+
+        self.setting_min_esperti = tk.IntVar(value=DEFAULT_MIN_ESPERTI)
+        regole_frame = ttk.LabelFrame(container, text="Parametri di generazione (Hard/Soft/Off)")
+        regole_frame.grid(row=4, column=0, columnspan=2, sticky="ew", padx=6, pady=10)
+        regole_frame.columnconfigure(1, weight=1)
+        ttk.Label(regole_frame, text="Regola").grid(row=0, column=0, padx=4, pady=(4, 2), sticky="w")
+        ttk.Label(regole_frame, text="Modalità").grid(row=0, column=1, padx=4, pady=(4, 2), sticky="w")
+        ttk.Label(regole_frame, text="Valore").grid(row=0, column=2, padx=4, pady=(4, 2), sticky="w")
+        self.generation_rule_vars: Dict[str, Dict[str, object]] = {}
+        for idx, (key, definition) in enumerate(RULE_DEFINITIONS.items(), start=1):
+            ttk.Label(regole_frame, text=definition.label).grid(row=idx, column=0, padx=4, pady=4, sticky="w")
+            mode_var = tk.StringVar(value=MODE_DISPLAY[definition.default_mode.value])
+            mode_combo = ttk.Combobox(
+                regole_frame,
+                textvariable=mode_var,
+                state="readonly",
+                values=list(MODE_DISPLAY.values()),
+            )
+            mode_combo.grid(row=idx, column=1, padx=4, pady=4, sticky="ew")
+            value_var: Optional[tk.IntVar] = None
+            value_widget: Optional[ttk.Spinbox] = None
+            if definition.has_value:
+                value_var = self.setting_min_esperti
+                spin = ttk.Spinbox(
+                    regole_frame,
+                    from_=definition.min_value or 0,
+                    to=definition.max_value or 10,
+                    textvariable=value_var,
+                    width=5,
+                )
+                spin.grid(row=idx, column=2, padx=4, pady=4, sticky="w")
+                value_widget = spin
+            else:
+                ttk.Label(regole_frame, text="—").grid(row=idx, column=2, padx=4, pady=4, sticky="w")
+            self.generation_rule_vars[key] = {
+                "mode_var": mode_var,
+                "mode_combo": mode_combo,
+                "value_var": value_var,
+                "definition": definition,
+                "value_widget": value_widget,
+            }
+            mode_combo.bind("<<ComboboxSelected>>", lambda _, k=key: self._on_rule_mode_changed(k))
+
+        for key in self.generation_rule_vars:
+            self._on_rule_mode_changed(key)
 
         giorni_frame = ttk.LabelFrame(container, text="Giorni della settimana da pianificare")
         giorni_frame.grid(row=5, column=0, columnspan=2, sticky="ew", padx=6, pady=10)
@@ -670,6 +739,7 @@ class SchedulerManagerApp(tk.Tk):
         btn_frame.grid(row=6, column=0, columnspan=2, pady=12)
         ttk.Button(btn_frame, text="Salva impostazioni", command=self.save_settings).grid(row=0, column=0, padx=4)
         ttk.Button(btn_frame, text="Ricarica", command=self.refresh_settings_inputs).grid(row=0, column=1, padx=4)
+        ttk.Button(btn_frame, text="Ripristina default", command=self.reset_generation_rules).grid(row=0, column=2, padx=4)
 
         helper = ttk.Label(
             container,
@@ -710,6 +780,23 @@ class SchedulerManagerApp(tk.Tk):
         for dow, var in self.setting_weekdays.items():
             var.set(dow in selezionati)
 
+        rule_configs = self.db.load_generation_rules_config()
+        for key, data in self.generation_rule_vars.items():
+            config = rule_configs.get(key) or GenerationRuleConfig()
+            display = MODE_DISPLAY.get(config.mode.value, MODE_DISPLAY[RuleMode.HARD.value])
+            data["mode_var"].set(display)
+            definition = data["definition"]
+            if definition.has_value and data["value_var"] is not None:
+                value = config.value if config.value is not None else definition.default_value
+                if value is not None:
+                    data["value_var"].set(value)
+            self._on_rule_mode_changed(key)
+        if (
+            "min_senior" in rule_configs
+            and rule_configs["min_senior"].value is not None
+        ):
+            self.setting_min_esperti.set(rule_configs["min_senior"].value)
+
     def save_settings(self) -> None:
         autisti_validi = self.autisti_names
         vigili_validi = self.vigili_names
@@ -730,7 +817,27 @@ class SchedulerManagerApp(tk.Tk):
         if not weekday_string:
             weekday_string = ",".join(str(x) for x in sorted(DEFAULT_ACTIVE_WEEKDAYS))
         self.db.set_setting("active_weekdays", weekday_string)
+
+        for key, data in self.generation_rule_vars.items():
+            definition = data["definition"]
+            mode_display = data["mode_var"].get()
+            mode_value = MODE_FROM_DISPLAY.get(mode_display, RuleMode.HARD.value)
+            config = GenerationRuleConfig(mode=RuleMode(mode_value))
+            if definition.has_value and data["value_var"] is not None:
+                value = data["value_var"].get()
+                if definition.min_value is not None:
+                    value = max(definition.min_value, value)
+                if definition.max_value is not None:
+                    value = min(definition.max_value, value)
+                data["value_var"].set(value)
+                config.value = value
+            self.db.save_generation_rule(key, config)
         messagebox.showinfo("Impostazioni salvate", "Le impostazioni sono state aggiornate correttamente.")
+
+    def reset_generation_rules(self) -> None:
+        self.db.reset_generation_rules_to_defaults()
+        self.refresh_settings_inputs()
+        messagebox.showinfo("Ripristino completato", "Le regole di generazione sono tornate ai valori di default.")
 
     # ---------------------- Tab: Generazione turni ---------------------- #
     def _build_generation_tab(self, container: ttk.Frame) -> None:
@@ -747,6 +854,34 @@ class SchedulerManagerApp(tk.Tk):
         ttk.Label(container, text="Seed (facoltativo)").grid(row=row, column=2, padx=6, pady=6, sticky="w")
         self.gen_seed = tk.StringVar()
         ttk.Entry(container, textvariable=self.gen_seed, width=12).grid(row=row, column=3, padx=6, pady=6, sticky="w")
+
+        row += 1
+        ttk.Label(container, text="Mesi da includere").grid(row=row, column=0, padx=6, pady=6, sticky="nw")
+        months_frame = ttk.Frame(container)
+        months_frame.grid(row=row, column=1, columnspan=3, padx=6, pady=6, sticky="w")
+        self.gen_all_months = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            months_frame,
+            text="Tutti i mesi",
+            variable=self.gen_all_months,
+            command=self._toggle_all_months,
+        ).grid(row=0, column=0, padx=4, pady=(0, 4), sticky="w")
+        self.gen_month_vars: Dict[int, tk.BooleanVar] = {}
+        for index, mese in enumerate(range(1, 13)):
+            var = tk.BooleanVar(value=True)
+            self.gen_month_vars[mese] = var
+            ttk.Checkbutton(
+                months_frame,
+                text=MONTH_LABELS[mese],
+                variable=var,
+                command=self._on_month_selection_changed,
+            ).grid(
+                row=1 + index // 4,
+                column=index % 4,
+                padx=4,
+                pady=2,
+                sticky="w",
+            )
 
         row += 1
         ttk.Label(container, text="Cartella output").grid(row=row, column=0, padx=6, pady=6, sticky="w")
@@ -879,6 +1014,27 @@ class SchedulerManagerApp(tk.Tk):
         self.gen_db_entry.configure(state=db_state)
         self._browse_db.configure(state=db_state)
 
+    def _on_rule_mode_changed(self, key: str) -> None:
+        data = self.generation_rule_vars.get(key, {})
+        widget = data.get("value_widget")
+        mode_var = data.get("mode_var")
+        if not widget or mode_var is None:
+            return
+        # Disattivando una regola non serve consentire l'editing del relativo valore numerico
+        mode_display = mode_var.get()
+        mode_value = MODE_FROM_DISPLAY.get(mode_display, RuleMode.HARD.value)
+        widget.configure(state="normal" if mode_value != RuleMode.OFF.value else "disabled")
+
+    def _toggle_all_months(self) -> None:
+        stato = self.gen_all_months.get()
+        for var in self.gen_month_vars.values():
+            var.set(stato)
+
+    def _on_month_selection_changed(self) -> None:
+        all_selected = all(var.get() for var in self.gen_month_vars.values())
+        if self.gen_all_months.get() != all_selected:
+            self.gen_all_months.set(all_selected)
+
     def _clear_generation_output(self) -> None:
         self.generate_output.configure(state="normal")
         self.generate_output.delete("1.0", "end")
@@ -897,7 +1053,7 @@ class SchedulerManagerApp(tk.Tk):
         out_dir = Path(self.gen_output_dir.get()).expanduser()
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        cmd = [sys.executable, str(Path(__file__).with_name("turnivvf_fixed.py")), "--year", str(year), "--out", str(out_dir)]
+        cmd = [sys.executable, str(Path(__file__).with_name("turnivvf.py")), "--year", str(year), "--out", str(out_dir)]
 
         seed = self.gen_seed.get().strip()
         if seed:
@@ -905,6 +1061,14 @@ class SchedulerManagerApp(tk.Tk):
                 messagebox.showerror("Errore", "Il seed deve essere un numero intero positivo.")
                 return
             cmd.extend(["--seed", seed])
+
+        mesi_selezionati = [mese for mese, var in self.gen_month_vars.items() if var.get()]
+        if not mesi_selezionati:
+            messagebox.showerror("Errore", "Seleziona almeno un mese da generare.")
+            return
+        if len(mesi_selezionati) < len(self.gen_month_vars):
+            cmd.append("--months")
+            cmd.extend(str(mese) for mese in sorted(mesi_selezionati))
 
         autisti_file = Path(self.gen_autisti_path.get()).expanduser()
         vigili_file = Path(self.gen_vigili_path.get()).expanduser()
@@ -955,12 +1119,14 @@ class SchedulerManagerApp(tk.Tk):
 
     def _run_generation_thread(self, cmd: List[str]) -> None:
         try:
+            encoding = locale.getpreferredencoding(False) or "utf-8"
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
-                encoding="utf-8",
+                encoding=encoding,
+                errors="replace",
             )
             assert process.stdout is not None
             for line in process.stdout:
